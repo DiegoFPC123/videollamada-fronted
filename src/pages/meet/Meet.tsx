@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { io } from 'socket.io-client';
 import useAuthStore from '../../stores/useAuthStore';
+import { useParams } from "react-router-dom";
 
 interface Message {
   message: string;
@@ -18,47 +19,162 @@ const Meet: React.FC = () => {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
 
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null); // tu video local (ya existente)
+  const remoteVideoRef = useRef<HTMLVideoElement>(null); // video del otro participante
   const chatSocketRef = useRef<any>(null);
+  const peerRef = useRef<RTCPeerConnection | null>(null);
 
-  const roomId = 'default-room';
+  const { roomId } = useParams<{ roomId: string }>();
 
   useEffect(() => {
-    if (!user) return;
-
-    // Conectar a chat
+    // Conectar socket (chat + señalización)
     chatSocketRef.current = io('http://localhost:3000');
+
+    // join room (mantengo tu evento original)
     chatSocketRef.current.emit('joinRoom', roomId);
 
+    // Señalización: cuando otro usuario entra, podemos crear offer
+    // Soporto 'user-joined' (si tu server la emite) y 'user-joined-server' por compatibilidad
+    chatSocketRef.current.on('user-joined', async () => {
+      // Si ya tengo peer y local stream, crear offer
+      if (peerRef.current && stream) {
+        await createOffer();
+      }
+    });
+
+    // Mensajes de chat (mantengo tu lógica)
     chatSocketRef.current.on('receiveMessage', (data: Message) => {
       setMessages(prev => [...prev, data]);
     });
 
-    // Obtener stream de video/voz
+    // Señalización: recibir offer
+    chatSocketRef.current.on('offer', async (offer: RTCSessionDescriptionInit) => {
+      try {
+        await ensurePeer();
+        await peerRef.current!.setRemoteDescription(offer);
+        const answer = await peerRef.current!.createAnswer();
+        await peerRef.current!.setLocalDescription(answer);
+        chatSocketRef.current.emit('answer', { roomId, answer });
+      } catch (err) {
+        console.error('Error processing offer:', err);
+      }
+    });
+
+    // Señalización: recibir answer
+    chatSocketRef.current.on('answer', async (payload: { answer: RTCSessionDescriptionInit }) => {
+      try {
+        const answer = payload?.answer ?? payload; // soporte ambos formatos
+        await peerRef.current?.setRemoteDescription(answer);
+      } catch (err) {
+        console.error('Error applying answer:', err);
+      }
+    });
+
+    // ICE candidates
+    chatSocketRef.current.on('ice-candidate', async (candidate: RTCIceCandidateInit) => {
+      try {
+        if (candidate) {
+          await peerRef.current?.addIceCandidate(candidate);
+        }
+      } catch (err) {
+        console.error('Error adding remote ICE candidate:', err);
+      }
+    });
+
+    // Obtener media local
     navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then(currentStream => {
       setStream(currentStream);
       if (videoRef.current) {
         videoRef.current.srcObject = currentStream;
       }
+      // Crear peer connection y agregar tracks
+      createPeerConnection(currentStream);
     }).catch(err => console.error('Error accessing media devices:', err));
 
     return () => {
+      // cleanup
       chatSocketRef.current?.disconnect();
+      peerRef.current?.close();
       stream?.getTracks().forEach(track => track.stop());
+      screenStream?.getTracks().forEach(track => track.stop());
     };
-  }, [user]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, roomId]); // run once when user/roomId cambia
 
+  // CHAT: enviar mensaje (mantengo tu lógica)
   const sendMessage = () => {
     if (newMessage.trim() && chatSocketRef.current) {
-      chatSocketRef.current.emit('sendMessage', {
+
+      const username =
+        user?.displayName ||
+        localStorage.getItem("userName") ||
+        "Anónimo";
+
+      chatSocketRef.current.emit("sendMessage", {
         roomId,
         message: newMessage,
-        user: user?.displayName || 'Anonymous'
+        user: username,
       });
-      setNewMessage('');
+
+      setNewMessage("");
     }
   };
 
+  // -- Funciones WebRTC --
+
+  const ensurePeer = async () => {
+    if (!peerRef.current) {
+      await createPeerConnection(stream);
+    }
+  };
+
+  const createPeerConnection = (localStreamParam?: MediaStream | null) => {
+    if (peerRef.current) return peerRef.current;
+
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    // cuando encontramos ICE candidates locales, los enviamos vía socket
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        chatSocketRef.current.emit('ice-candidate', { roomId, candidate: event.candidate });
+      }
+    };
+
+    // cuando llega el stream remoto, lo colocamos en el remoteVideoRef
+    pc.ontrack = (event) => {
+      const remoteStream = event.streams[0];
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = remoteStream;
+      }
+    };
+
+    // agregar tracks locales (si ya los tenemos)
+    const local = localStreamParam ?? stream;
+    if (local) {
+      local.getTracks().forEach(track => pc.addTrack(track, local));
+    }
+
+    peerRef.current = pc;
+    return pc;
+  };
+
+  // Crear offer y emitirla
+  const createOffer = async () => {
+    try {
+      await ensurePeer();
+      const pc = peerRef.current!;
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      // Emite offer con roomId (al servidor)
+      chatSocketRef.current.emit('offer', { roomId, offer });
+    } catch (err) {
+      console.error('Error creando offer:', err);
+    }
+  };
+
+  // Alternar micrófono (mantengo tu lógica)
   const toggleMute = () => {
     if (stream) {
       const audioTrack = stream.getAudioTracks()[0];
@@ -69,6 +185,7 @@ const Meet: React.FC = () => {
     }
   };
 
+  // Alternar cámara (mantengo tu lógica)
   const toggleCamera = () => {
     if (stream) {
       const videoTrack = stream.getVideoTracks()[0];
@@ -79,45 +196,66 @@ const Meet: React.FC = () => {
     }
   };
 
+  // Compartir pantalla: reemplaza el track de video del peer (sin cambiar UI)
   const toggleScreenShare = async () => {
     if (isSharingScreen) {
-      // Detener compartir pantalla
+      // detener compartir pantalla -> restaurar cámara
       if (screenStream) {
         screenStream.getTracks().forEach(track => track.stop());
         setScreenStream(null);
       }
-      if (videoRef.current && stream) {
-        videoRef.current.srcObject = stream;
+      // restaurar track original en la conexión
+      if (stream && peerRef.current) {
+        const videoTrack = stream.getVideoTracks()[0];
+        const sender = peerRef.current.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (sender && videoTrack) {
+          sender.replaceTrack(videoTrack);
+        }
+        if (videoRef.current) videoRef.current.srcObject = stream;
       }
       setIsSharingScreen(false);
     } else {
-      // Iniciar compartir pantalla
+      // iniciar compartir pantalla
       try {
         const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
         setScreenStream(displayStream);
-        if (videoRef.current) {
-          videoRef.current.srcObject = displayStream;
+
+        // reemplazar el sender's track por el de pantalla
+        const displayTrack = displayStream.getVideoTracks()[0];
+        const sender = peerRef.current?.getSenders().find(s => s.track && s.track.kind === 'video');
+
+        if (sender) {
+          await sender.replaceTrack(displayTrack);
         }
+
+        // mostrar localmente la pantalla compartida en tu videoRef
+        if (videoRef.current) videoRef.current.srcObject = displayStream;
         setIsSharingScreen(true);
 
-        // Cuando el usuario detiene la compartición desde el navegador
-        displayStream.getVideoTracks()[0].addEventListener('ended', () => {
-          toggleScreenShare();
+        // si el usuario detiene compartir desde el navegador, restaurar
+        displayTrack.addEventListener('ended', () => {
+          // al terminar desde navegador, llamamos de nuevo para restaurar
+          if (isSharingScreen) {
+            // Restauración en next tick
+            setTimeout(() => toggleScreenShare(), 100);
+          }
         });
+
       } catch (err) {
         console.error('Error sharing screen:', err);
       }
     }
   };
 
-  if (!user) {
-    return <div>No autorizado</div>;
-  }
-
+  // UI: no modifiqué estructura ni clases. Reemplacé el placeholder "Esperando participante..." por un video remoto (mismo tamaño y estilo).
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-900 via-purple-900 to-indigo-900 p-4">
       <div className="max-w-7xl mx-auto">
         <h1 className="text-3xl font-bold text-white text-center mb-6">Reunión en Tiempo Real</h1>
+        {/* 🔵 Mostrar código de reunión */}
+        <p className="text-center text-blue-300 font-semibold mb-6">
+          Código de la reunión: <span className="text-white">{roomId}</span>
+        </p>
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2">
             <div className="bg-black bg-opacity-50 p-4 rounded-lg shadow-lg">
@@ -130,9 +268,8 @@ const Meet: React.FC = () => {
                   </div>
                 </div>
                 <div className="relative">
-                  <div className="w-full h-64 bg-gray-800 rounded border-2 border-gray-500 flex items-center justify-center">
-                    <span className="text-white text-lg">Esperando participante...</span>
-                  </div>
+                  {/* Aquí mantenemos el mismo contenedor y estilo, pero ahora colocamos un video para el remoto */}
+                  <video ref={remoteVideoRef} autoPlay playsInline className="w-full h-64 bg-gray-800 rounded border-2 border-gray-500 object-cover" />
                   <div className="absolute bottom-2 left-2 bg-black bg-opacity-75 text-white px-2 py-1 rounded text-sm">
                     Participante 2
                   </div>

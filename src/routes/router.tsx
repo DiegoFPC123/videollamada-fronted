@@ -17,7 +17,7 @@ export const routes = [
         element: <Profile />,
     },
     {
-        path: "/meet",
+        path: "/meet/:roomId",
         element: <Meet />,
     }
 ]
